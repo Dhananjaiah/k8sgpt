@@ -1,0 +1,319 @@
+# K8sGPT Automated Scanning CronJob
+# This CronJob runs K8sGPT scans periodically and stores results
+# Useful for continuous cluster monitoring
+
+---
+# Namespace for K8sGPT resources (optional but recommended)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8sgpt-system
+
+---
+# ServiceAccount for K8sGPT with read-only permissions
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8sgpt-scanner
+  namespace: k8sgpt-system
+
+---
+# ClusterRole with read-only access to cluster resources
+# K8sGPT needs to read resources to analyze them
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8sgpt-analyzer
+rules:
+# Core resources
+- apiGroups: [""]
+  resources:
+    - pods
+    - services
+    - endpoints
+    - configmaps
+    - secrets
+    - persistentvolumeclaims
+    - persistentvolumes
+    - nodes
+    - namespaces
+    - events
+    - serviceaccounts
+  verbs: ["get", "list"]
+
+# Apps resources
+- apiGroups: ["apps"]
+  resources:
+    - deployments
+    - replicasets
+    - statefulsets
+    - daemonsets
+  verbs: ["get", "list"]
+
+# Batch resources
+- apiGroups: ["batch"]
+  resources:
+    - jobs
+    - cronjobs
+  verbs: ["get", "list"]
+
+# Networking resources
+- apiGroups: ["networking.k8s.io"]
+  resources:
+    - ingresses
+    - networkpolicies
+  verbs: ["get", "list"]
+
+# Autoscaling resources
+- apiGroups: ["autoscaling"]
+  resources:
+    - horizontalpodautoscalers
+  verbs: ["get", "list"]
+
+# Policy resources
+- apiGroups: ["policy"]
+  resources:
+    - poddisruptionbudgets
+  verbs: ["get", "list"]
+
+# Storage resources
+- apiGroups: ["storage.k8s.io"]
+  resources:
+    - storageclasses
+  verbs: ["get", "list"]
+
+---
+# Bind the ClusterRole to the ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8sgpt-analyzer-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8sgpt-analyzer
+subjects:
+- kind: ServiceAccount
+  name: k8sgpt-scanner
+  namespace: k8sgpt-system
+
+---
+# Secret to store OpenAI API key (if using AI backend)
+# Create this secret manually with your API key:
+# kubectl create secret generic k8sgpt-secret \
+#   --from-literal=openai-api-key=YOUR_API_KEY_HERE \
+#   -n k8sgpt-system
+apiVersion: v1
+kind: Secret
+metadata:
+  name: k8sgpt-secret
+  namespace: k8sgpt-system
+type: Opaque
+data:
+  # Base64 encoded placeholder - REPLACE WITH YOUR ACTUAL KEY
+  # To create: echo -n "YOUR_OPENAI_API_KEY" | base64
+  # Or use kubectl create secret (recommended)
+  openai-api-key: WU9VUl9PUEVOQUlfQVBJX0tFWQ==
+
+---
+# ConfigMap to store K8sGPT configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8sgpt-config
+  namespace: k8sgpt-system
+data:
+  # Scan configuration
+  scan-interval: "30m"
+  namespaces: "default,production,staging"  # Comma-separated list or "all"
+  filters: "Pod,Service,Deployment,Ingress"  # Which resource types to scan
+  enable-explain: "true"  # Use AI explanations (requires API key)
+  
+  # Script to run K8sGPT scan
+  scan.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "=========================================="
+    echo "K8sGPT Scan Started: $(date)"
+    echo "=========================================="
+    
+    # Configuration
+    NAMESPACES="${SCAN_NAMESPACES:-all}"
+    FILTERS="${SCAN_FILTERS:-Pod,Service,Deployment}"
+    ENABLE_EXPLAIN="${ENABLE_EXPLAIN:-false}"
+    
+    # Build K8sGPT command
+    CMD="k8sgpt analyze --output json"
+    
+    if [ "$NAMESPACES" != "all" ]; then
+      # Scan each namespace separately
+      IFS=',' read -ra NS_ARRAY <<< "$NAMESPACES"
+      for ns in "${NS_ARRAY[@]}"; do
+        echo "Scanning namespace: $ns"
+        k8sgpt analyze --namespace "$ns" --filter "$FILTERS" ${ENABLE_EXPLAIN:+--explain}
+      done
+    else
+      # Scan all namespaces
+      echo "Scanning all namespaces"
+      k8sgpt analyze --all-namespaces --filter "$FILTERS" ${ENABLE_EXPLAIN:+--explain}
+    fi
+    
+    echo ""
+    echo "=========================================="
+    echo "K8sGPT Scan Completed: $(date)"
+    echo "=========================================="
+
+---
+# CronJob that runs K8sGPT scans periodically
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: k8sgpt-scanner
+  namespace: k8sgpt-system
+spec:
+  # Schedule: Run every 30 minutes
+  # Adjust as needed:
+  # - "*/15 * * * *"  -> Every 15 minutes
+  # - "0 * * * *"     -> Every hour
+  # - "0 */6 * * *"   -> Every 6 hours
+  # - "0 9 * * *"     -> Daily at 9 AM
+  schedule: "*/30 * * * *"
+  
+  # Keep last 3 successful and 1 failed job
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  
+  # Don't run if previous job is still running
+  concurrencyPolicy: Forbid
+  
+  jobTemplate:
+    spec:
+      # Job timeout - scan should complete within 10 minutes
+      activeDeadlineSeconds: 600
+      
+      template:
+        metadata:
+          labels:
+            app: k8sgpt-scanner
+        spec:
+          serviceAccountName: k8sgpt-scanner
+          restartPolicy: OnFailure
+          
+          containers:
+          - name: k8sgpt
+            # Use official K8sGPT container image
+            # Check for latest version: https://github.com/k8sgpt-ai/k8sgpt/pkgs/container/k8sgpt
+            image: ghcr.io/k8sgpt-ai/k8sgpt:v0.3.26
+            
+            # Command to run
+            command: ["/bin/sh"]
+            args:
+              - -c
+              - |
+                # Optional: Configure AI backend
+                if [ -n "$OPENAI_API_KEY" ]; then
+                  k8sgpt auth add --backend openai --password "$OPENAI_API_KEY"
+                fi
+                
+                # Run scan
+                echo "Starting K8sGPT scan..."
+                k8sgpt analyze --all-namespaces --explain || true
+                
+                echo "Scan completed at $(date)"
+            
+            # Environment variables from ConfigMap
+            env:
+            - name: SCAN_NAMESPACES
+              valueFrom:
+                configMapKeyRef:
+                  name: k8sgpt-config
+                  key: namespaces
+            - name: SCAN_FILTERS
+              valueFrom:
+                configMapKeyRef:
+                  name: k8sgpt-config
+                  key: filters
+            - name: ENABLE_EXPLAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: k8sgpt-config
+                  key: enable-explain
+            
+            # OpenAI API key from Secret (if using AI backend)
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: k8sgpt-secret
+                  key: openai-api-key
+                  optional: true  # Allow running without API key
+            
+            # Resource limits
+            resources:
+              requests:
+                memory: "128Mi"
+                cpu: "100m"
+              limits:
+                memory: "256Mi"
+                cpu: "200m"
+
+---
+# Optional: PersistentVolumeClaim to store scan results
+# Uncomment if you want to persist logs across runs
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: k8sgpt-logs
+#   namespace: k8sgpt-system
+# spec:
+#   accessModes:
+#     - ReadWriteOnce
+#   resources:
+#     requests:
+#       storage: 1Gi
+
+---
+# How to use this CronJob:
+#
+# 1. Create the secret with your OpenAI API key:
+#    kubectl create secret generic k8sgpt-secret \
+#      --from-literal=openai-api-key=YOUR_API_KEY \
+#      -n k8sgpt-system
+#
+# 2. Deploy the CronJob:
+#    kubectl apply -f cronjob-k8sgpt-scan.yaml
+#
+# 3. Verify it's created:
+#    kubectl get cronjob -n k8sgpt-system
+#
+# 4. Trigger a manual run (for testing):
+#    kubectl create job k8sgpt-manual-scan \
+#      --from=cronjob/k8sgpt-scanner \
+#      -n k8sgpt-system
+#
+# 5. Check job logs:
+#    kubectl logs -n k8sgpt-system -l app=k8sgpt-scanner --tail=100
+#
+# 6. View job history:
+#    kubectl get jobs -n k8sgpt-system
+#
+# 7. Adjust schedule in the CronJob spec if needed:
+#    kubectl edit cronjob k8sgpt-scanner -n k8sgpt-system
+#
+# 8. Delete when no longer needed:
+#    kubectl delete -f cronjob-k8sgpt-scan.yaml
+
+---
+# Advanced: Send results to Slack/Email
+# To integrate with alerting, you can:
+# 1. Add a sidecar container that processes K8sGPT output
+# 2. Parse JSON output and send to webhook
+# 3. Use ConfigMap to store webhook URLs
+# 4. Example: Add curl commands to post results to Slack webhook
+#
+# Example Slack notification:
+# if k8sgpt analyze --output json | jq -e '.problems > 0'; then
+#   curl -X POST https://hooks.slack.com/services/YOUR/WEBHOOK/URL \
+#     -H 'Content-Type: application/json' \
+#     -d '{"text":"K8sGPT found cluster issues!"}'
+# fi
