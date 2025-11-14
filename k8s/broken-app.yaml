@@ -1,0 +1,166 @@
+# Broken Application Demo
+# This manifest intentionally contains several common Kubernetes mistakes
+# Use with K8sGPT to practice troubleshooting
+
+---
+# ConfigMap - This one exists and is correct
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: default
+data:
+  APP_ENV: "demo"
+  LOG_LEVEL: "info"
+  DATABASE_URL: "postgres://localhost:5432/demo"
+
+---
+# Deployment with multiple intentional issues
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken-app
+  namespace: default
+  labels:
+    app: broken-app
+spec:
+  # We want 2 replicas
+  replicas: 2
+  selector:
+    matchLabels:
+      app: broken-app
+  template:
+    metadata:
+      labels:
+        app: broken-app
+        version: v1
+    spec:
+      containers:
+      - name: broken-app-container
+        # PROBLEM 1: This image tag doesn't exist
+        # This will cause ImagePullBackOff
+        # Fix: Change to nginx:alpine or nginx:1.24
+        image: nginx:nonexistent
+        
+        ports:
+        - containerPort: 80
+          name: http
+        
+        # PROBLEM 3: Referencing a ConfigMap with wrong name
+        # There is no ConfigMap named 'app-config-typo'
+        # This will cause CreateContainerConfigError once image issue is fixed
+        # Fix: Change to 'app-config' (which exists above)
+        envFrom:
+        - configMapRef:
+            name: app-config-typo
+        
+        # Some environment variables
+        env:
+        - name: APP_NAME
+          value: "broken-demo-app"
+        - name: PORT
+          value: "80"
+        
+        # Resource limits - these are reasonable for nginx
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        
+        # Liveness probe - will only work once container starts
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        
+        # Readiness probe
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+# Service with intentional issue
+apiVersion: v1
+kind: Service
+metadata:
+  name: broken-app-service
+  namespace: default
+  labels:
+    app: broken-app
+spec:
+  type: ClusterIP
+  
+  # PROBLEM 2: Service selector doesn't match pod labels
+  # Pods have label 'app: broken-app'
+  # But service is looking for 'app: webapp'
+  # This will cause "No endpoints available" error
+  # Fix: Change selector to match pod labels: app: broken-app
+  selector:
+    app: webapp
+  
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+    protocol: TCP
+
+---
+# Optional: Ingress (if you want to test external access)
+# Uncomment if your cluster has an Ingress controller
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: broken-app-ingress
+#   namespace: default
+#   annotations:
+#     kubernetes.io/ingress.class: "nginx"
+# spec:
+#   rules:
+#   - host: broken-app.local
+#     http:
+#       paths:
+#       - path: /
+#         pathType: Prefix
+#         backend:
+#           service:
+#             name: broken-app-service
+#             port:
+#               number: 80
+
+---
+# How to use this file:
+# 
+# 1. Deploy:
+#    kubectl apply -f broken-app.yaml
+#
+# 2. Watch pods fail:
+#    kubectl get pods -l app=broken-app -w
+#
+# 3. Traditional troubleshooting (the hard way):
+#    kubectl describe pod -l app=broken-app
+#    kubectl logs -l app=broken-app
+#    kubectl get events
+#
+# 4. Use K8sGPT (the easy way):
+#    k8sgpt analyze --namespace default --explain
+#
+# 5. Fix the problems:
+#    - Fix image: kubectl set image deployment/broken-app broken-app-container=nginx:alpine
+#    - Fix service selector: kubectl patch service broken-app-service -p '{"spec":{"selector":{"app":"broken-app"}}}'
+#    - Fix ConfigMap ref: kubectl edit deployment broken-app (change app-config-typo to app-config)
+#
+# 6. Verify fixes:
+#    k8sgpt analyze --namespace default
+#    kubectl get pods -l app=broken-app
+#    kubectl get endpoints broken-app-service
+#
+# 7. Cleanup:
+#    kubectl delete -f broken-app.yaml
